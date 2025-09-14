@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+.venv/
+venv/
+env/
+ups-mqtt-venv/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Systemd runtime stuff
+*.service~
+*.swp
