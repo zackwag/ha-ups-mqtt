@@ -1,6 +1,10 @@
+import json
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from nut2mqtt import (
+    _identity_from_ups_data,
     build_binary_sensor_discovery,
     build_command_discovery,
     build_command_topic,
@@ -9,9 +13,14 @@ from nut2mqtt import (
     build_state_topic,
     build_switch_discovery,
     first_value,
+    load_last_values,
     make_entity_id,
+    process_poll,
+    read_ups,
     require_config,
+    run_upscmd,
     sanitize_slug,
+    save_last_values,
     switch_state_from_status,
     switch_state_on_values,
     validate_config,
@@ -365,3 +374,214 @@ class TestBuildSwitchDiscovery:
     def test_returns_none_missing_commands(self):
         switch = {"key": "beeper", "status_key": "ups.beeper.status"}
         assert build_switch_discovery(switch, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
+
+
+# --- _identity_from_ups_data ---
+
+
+class TestIdentityFromUpsData:
+    def test_full_data(self):
+        data = {
+            "device.mfr": "CyberPower",
+            "device.model": "CP1500",
+            "driver.version": "2.8.0",
+            "driver.version.data": "HID 0.47",
+        }
+        result = _identity_from_ups_data(data)
+        assert result["manufacturer"] == "CyberPower"
+        assert result["model"] == "CP1500"
+        assert result["sw_version"] == "2.8.0 (HID 0.47)"
+
+    def test_ups_fallback_fields(self):
+        data = {"ups.mfr": "APC", "ups.model": "Back-UPS"}
+        result = _identity_from_ups_data(data)
+        assert result["manufacturer"] == "APC"
+        assert result["model"] == "Back-UPS"
+
+    def test_driver_version_only(self):
+        data = {"driver.version": "2.8.0"}
+        result = _identity_from_ups_data(data)
+        assert result["sw_version"] == "2.8.0"
+
+    def test_empty_data(self):
+        result = _identity_from_ups_data({})
+        assert result["manufacturer"] is None
+        assert result["model"] is None
+        assert result["sw_version"] is None
+
+
+# --- read_ups (mocked subprocess) ---
+
+
+class TestReadUps:
+    @patch("nut2mqtt.subprocess.run")
+    def test_parses_output(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="battery.charge: 100\nups.status: OL\ninput.voltage: 120.3\n",
+        )
+        result = read_ups("myups")
+        assert result["battery.charge"] == "100"
+        assert result["ups.status"] == "OL"
+        assert result["input.voltage"] == "120.3"
+
+    @patch("nut2mqtt.subprocess.run")
+    def test_handles_colon_in_value(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="ups.id: my:ups:name\n",
+        )
+        result = read_ups("myups")
+        assert result["ups.id"] == "my:ups:name"
+
+    @patch("nut2mqtt.subprocess.run")
+    def test_returns_empty_on_failure(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        assert read_ups("myups") == {}
+
+    @patch("nut2mqtt.subprocess.run", side_effect=Exception("not found"))
+    def test_returns_empty_on_exception(self, mock_run):
+        assert read_ups("myups") == {}
+
+
+# --- run_upscmd (mocked subprocess) ---
+
+
+class TestRunUpscmd:
+    @patch("nut2mqtt.subprocess.run")
+    def test_success(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0)
+        assert run_upscmd("myups", "beeper.mute", "admin", "pass") is True
+
+    @patch("nut2mqtt.subprocess.run")
+    def test_failure(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="access denied")
+        assert run_upscmd("myups", "beeper.mute", "admin", "pass") is False
+
+    @patch("nut2mqtt.subprocess.run", side_effect=Exception("boom"))
+    def test_exception(self, mock_run):
+        assert run_upscmd("myups", "beeper.mute", "admin", "pass") is False
+
+
+# --- Persistence ---
+
+
+class TestPersistence:
+    def test_save_and_load(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "last.json")
+        monkeypatch.setattr("nut2mqtt.LAST_VALUES_FILE", path)
+        save_last_values({"sensor_a": "42"})
+        result = load_last_values()
+        assert result == {"sensor_a": "42"}
+
+    def test_load_missing_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("nut2mqtt.LAST_VALUES_FILE", str(tmp_path / "nope.json"))
+        assert load_last_values() == {}
+
+    def test_load_corrupt_json(self, tmp_path, monkeypatch):
+        path = tmp_path / "bad.json"
+        path.write_text("not json{{{")
+        monkeypatch.setattr("nut2mqtt.LAST_VALUES_FILE", str(path))
+        assert load_last_values() == {}
+
+
+# --- process_poll ---
+
+
+class TestProcessPoll:
+    def _make_sensor_lookup(self):
+        return {
+            "my_ups_battery_charge": {
+                "key": "battery.charge",
+                "state_topic": "nut2mqtt/my_ups_battery_charge/state",
+                "beeper": False,
+            },
+            "my_ups_ups_status": {
+                "key": "ups.status",
+                "state_topic": "nut2mqtt/my_ups_ups_status/state",
+                "beeper": False,
+            },
+            "my_ups_beeper_status": {
+                "key": "ups.beeper.status",
+                "state_topic": "nut2mqtt/my_ups_beeper_status/state",
+                "beeper": True,
+            },
+        }
+
+    def test_publishes_changed_values(self):
+        client = MagicMock()
+        last_values = {}
+        ups_data = {"battery.charge": "100", "ups.status": "OL"}
+
+        process_poll(client, ups_data, self._make_sensor_lookup(), {},
+                     last_values, AVAIL_TOPIC, "nut2mqtt/bin/avail")
+
+        published_topics = [c[0][0] for c in client.publish.call_args_list]
+        assert "nut2mqtt/my_ups_battery_charge/state" in published_topics
+        assert last_values["my_ups_battery_charge"] == "100"
+
+    def test_skips_unchanged_values(self):
+        client = MagicMock()
+        last_values = {"my_ups_battery_charge": "100"}
+        ups_data = {"battery.charge": "100"}
+
+        process_poll(client, ups_data, self._make_sensor_lookup(), {},
+                     last_values, AVAIL_TOPIC, "nut2mqtt/bin/avail")
+
+        state_publishes = [c for c in client.publish.call_args_list
+                           if c[0][0] == "nut2mqtt/my_ups_battery_charge/state"]
+        assert len(state_publishes) == 0
+
+    def test_marks_offline_when_no_data(self):
+        client = MagicMock()
+        last_values = {"my_ups_battery_charge": "100"}
+
+        process_poll(client, {}, self._make_sensor_lookup(), {},
+                     last_values, AVAIL_TOPIC, "nut2mqtt/bin/avail")
+
+        offline_calls = [c for c in client.publish.call_args_list
+                         if c[0][1] == "offline"]
+        assert len(offline_calls) == 2
+        assert last_values == {}
+
+    def test_beeper_title_cased(self):
+        client = MagicMock()
+        last_values = {}
+        ups_data = {"ups.beeper.status": "enabled"}
+
+        process_poll(client, ups_data, self._make_sensor_lookup(), {},
+                     last_values, AVAIL_TOPIC, "nut2mqtt/bin/avail")
+
+        assert last_values["my_ups_beeper_status"] == "Enabled"
+
+    def test_prunes_stale_sensors(self):
+        client = MagicMock()
+        last_values = {"my_ups_battery_charge": "100", "my_ups_stale_sensor": "old"}
+        ups_data = {"battery.charge": "100"}
+
+        process_poll(client, ups_data, self._make_sensor_lookup(), {},
+                     last_values, AVAIL_TOPIC, "nut2mqtt/bin/avail")
+
+        assert "my_ups_stale_sensor" not in last_values
+
+    @patch("nut2mqtt.save_last_values")
+    def test_publishes_switch_state(self, mock_save):
+        client = MagicMock()
+        last_values = {}
+        ups_data = {"ups.beeper.status": "enabled"}
+        switch_lookup = {
+            "my_ups_beeper": {
+                "status_key": "ups.beeper.status",
+                "state_topic": "nut2mqtt/my_ups_beeper/state",
+                "state_on": {"enabled", "muted"},
+            },
+        }
+
+        process_poll(client, ups_data, {}, switch_lookup,
+                     last_values, AVAIL_TOPIC, "nut2mqtt/bin/avail")
+
+        switch_publishes = [c for c in client.publish.call_args_list
+                            if c[0][0] == "nut2mqtt/my_ups_beeper/state"]
+        assert len(switch_publishes) == 1
+        assert switch_publishes[0][0][1] == "ON"
+        assert last_values["my_ups_beeper"] == "ON"
