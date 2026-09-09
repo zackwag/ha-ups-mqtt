@@ -1,9 +1,13 @@
 import pytest
 
 from nut2mqtt import (
+    build_binary_sensor_discovery,
+    build_command_discovery,
     build_command_topic,
     build_discovery_topic,
+    build_sensor_discovery,
     build_state_topic,
+    build_switch_discovery,
     first_value,
     make_entity_id,
     require_config,
@@ -226,3 +230,138 @@ class TestSwitchStateFromStatus:
 
     def test_muted_counts_as_on(self):
         assert switch_state_from_status("muted", {"enabled", "muted"}) == "ON"
+
+
+# --- Shared fixtures for discovery tests ---
+
+
+DEVICE_INFO = {
+    "identifiers": ["my_ups"],
+    "name": "My UPS",
+    "manufacturer": "CyberPower",
+    "model": "CP1500",
+    "sw_version": "2.8.0",
+}
+BASE_TOPIC = "nut2mqtt"
+AVAIL_TOPIC = "nut2mqtt/my_ups_sensors/availability"
+
+
+# --- build_sensor_discovery ---
+
+
+class TestBuildSensorDiscovery:
+    def test_basic_sensor(self):
+        sensor = {"key": "battery.charge", "friendly_name": "Battery Charge", "unit": "%", "icon": "mdi:battery", "device_class": "battery"}
+        payload, entity_id = build_sensor_discovery(sensor, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert entity_id == "my_ups_battery_charge"
+        assert payload["name"] == "My UPS Battery Charge"
+        assert payload["unique_id"] == "my_ups_battery_charge"
+        assert payload["state_topic"] == "nut2mqtt/my_ups_battery_charge/state"
+        assert payload["unit_of_measurement"] == "%"
+        assert payload["icon"] == "mdi:battery"
+        assert payload["device_class"] == "battery"
+        assert payload["device"] is DEVICE_INFO
+        assert payload["availability_topic"] == AVAIL_TOPIC
+
+    def test_entity_category(self):
+        sensor = {"key": "battery.runtime", "friendly_name": "Runtime", "entity_category": "diagnostic"}
+        payload, _ = build_sensor_discovery(sensor, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert payload["entity_category"] == "diagnostic"
+
+    def test_no_optional_fields(self):
+        sensor = {"key": "ups.status", "friendly_name": "Status"}
+        payload, _ = build_sensor_discovery(sensor, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert "unit_of_measurement" not in payload
+        assert "icon" not in payload
+        assert "device_class" not in payload
+
+    def test_strips_device_name_prefix(self):
+        sensor = {"key": "ups.load", "friendly_name": "My UPS Load"}
+        payload, _ = build_sensor_discovery(sensor, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert payload["name"] == "My UPS Load"
+
+    def test_returns_none_for_missing_key(self):
+        assert build_sensor_discovery({}, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
+        assert build_sensor_discovery({"key": ""}, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
+
+
+# --- build_binary_sensor_discovery ---
+
+
+class TestBuildBinarySensorDiscovery:
+    def test_basic(self):
+        payload, entity_id = build_binary_sensor_discovery(
+            "my_ups", "My UPS", "nut2mqtt/my_ups_connected/availability", DEVICE_INFO
+        )
+        assert entity_id == "my_ups_connected"
+        assert payload["name"] == "My UPS Connected"
+        assert payload["device_class"] == "connectivity"
+        assert payload["payload_on"] == "online"
+        assert payload["payload_off"] == "offline"
+        assert payload["unique_id"] == "my_ups_connected"
+
+
+# --- build_command_discovery ---
+
+
+class TestBuildCommandDiscovery:
+    def test_basic_command(self):
+        command = {"key": "beeper.mute", "friendly_name": "Mute Beeper", "icon": "mdi:volume-mute", "entity_category": "config"}
+        payload, entity_id = build_command_discovery(command, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert entity_id == "my_ups_beeper_mute"
+        assert payload["name"] == "My UPS Mute Beeper"
+        assert payload["command_topic"] == "nut2mqtt/my_ups_beeper_mute/set"
+        assert payload["payload_press"] == "PRESS"
+        assert payload["icon"] == "mdi:volume-mute"
+        assert payload["entity_category"] == "config"
+
+    def test_returns_none_for_missing_key(self):
+        assert build_command_discovery({}, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
+
+    def test_no_optional_fields(self):
+        command = {"key": "test.battery", "friendly_name": "Test"}
+        payload, _ = build_command_discovery(command, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert "icon" not in payload
+        assert "entity_category" not in payload
+
+
+# --- build_switch_discovery ---
+
+
+class TestBuildSwitchDiscovery:
+    SWITCH = {
+        "key": "beeper",
+        "friendly_name": "Beeper",
+        "status_key": "ups.beeper.status",
+        "command_on": "beeper.enable",
+        "command_off": "beeper.disable",
+        "icon": "mdi:bell",
+        "entity_category": "config",
+    }
+
+    def test_basic_switch(self):
+        payload, entity_id = build_switch_discovery(self.SWITCH, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert entity_id == "my_ups_beeper"
+        assert payload["name"] == "My UPS Beeper"
+        assert payload["state_topic"] == "nut2mqtt/my_ups_beeper/state"
+        assert payload["command_topic"] == "nut2mqtt/my_ups_beeper/set"
+        assert payload["payload_on"] == "ON"
+        assert payload["payload_off"] == "OFF"
+        assert payload["optimistic"] is False
+        assert payload["icon"] == "mdi:bell"
+
+    def test_optimistic(self):
+        switch = {**self.SWITCH, "optimistic": True}
+        payload, _ = build_switch_discovery(switch, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC)
+        assert payload["optimistic"] is True
+
+    def test_returns_none_missing_key(self):
+        assert build_switch_discovery({}, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
+
+    def test_returns_none_missing_status_key(self):
+        switch = {"key": "beeper", "command_on": "on", "command_off": "off"}
+        assert build_switch_discovery(switch, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
+
+    def test_returns_none_missing_commands(self):
+        switch = {"key": "beeper", "status_key": "ups.beeper.status"}
+        assert build_switch_discovery(switch, DEVICE_INFO, BASE_TOPIC, AVAIL_TOPIC) is None
