@@ -19,7 +19,7 @@ jobs:
     permissions:
       contents: write   # create the GitHub release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: docker/setup-qemu-action@v4
 
